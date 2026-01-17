@@ -2,6 +2,7 @@
 python-version = "3.11"
 
 [deploy]
-startCommand = "python main.py"
+startCommand = "python bot.py"
 restartPolicyType = "always"
+
 
