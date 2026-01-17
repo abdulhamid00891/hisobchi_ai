@@ -1,442 +1,658 @@
+"""
+Hisobchi Bot - O'zbekcha moliyaviy hisobchi Telegram bot
+Barcha kodlar bitta faylda - Railway deploy uchun
+"""
 import os
+import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import re
+import tempfile
+from datetime import datetime, date, timedelta
+
+import aiosqlite
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import BOT_TOKEN, REQUIRED_CHANNELS, MESSAGES
-from database import init_db, add_user, add_to_playlist, get_playlist
-from downloader import is_valid_url, extract_url, download_video, download_audio, cleanup_file, get_video_info
+# ============== CONFIG ==============
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8450831935:AAGhmhvWFmQH-4AOrOUFyDfiv_ufJYvXztw")
+REMINDER_DAYS = [3, 1, 0]
+DB_PATH = "hisobchi.db"
 
-# Logging sozlash
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Foydalanuvchi ma'lumotlarini saqlash
-user_last_url = {}
-user_selected_quality = {}
+# Conversation states
+(DEBT_NAME, DEBT_AMOUNT, DEBT_PAYMENT_TYPE, DEBT_GIVEN_DATE, 
+ DEBT_DUE_DATE, DEBT_INSTALLMENTS, DEBT_CONFIRM) = range(7)
+EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(7, 10)
 
-def get_channel_keyboard():
-    """Kanallar tugmalari"""
+# ============== KEYBOARDS ==============
+def main_menu_keyboard():
+    keyboard = [
+        [KeyboardButton("💰 Qarz berdim"), KeyboardButton("💸 Qarz oldim")],
+        [KeyboardButton("📝 Kunlik harajat")],
+        [KeyboardButton("📊 Statistika"), KeyboardButton("📋 Mening qarzlarim")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def payment_type_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💵 Bir marta to'lash", callback_data="payment_one_time")],
+        [InlineKeyboardButton("📅 Bo'lib to'lash", callback_data="payment_installment")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def date_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📅 Bugun", callback_data="date_today")],
+        [InlineKeyboardButton("✏️ Boshqa sana", callback_data="date_custom")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def confirm_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("✅ Tasdiqlash", callback_data="confirm_yes"),
+         InlineKeyboardButton("❌ Bekor qilish", callback_data="confirm_no")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def my_debts_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💰 Bergan qarzlarim", callback_data="view_given")],
+        [InlineKeyboardButton("💸 Olgan qarzlarim", callback_data="view_taken")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def expense_category_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🍔 Oziq-ovqat", callback_data="cat_food"),
+         InlineKeyboardButton("🚗 Transport", callback_data="cat_transport")],
+        [InlineKeyboardButton("🏠 Uy-joy", callback_data="cat_home"),
+         InlineKeyboardButton("👕 Kiyim", callback_data="cat_clothes")],
+        [InlineKeyboardButton("💊 Sog'liq", callback_data="cat_health"),
+         InlineKeyboardButton("📦 Boshqa", callback_data="cat_other")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def installment_count_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("2 oy", callback_data="inst_2"),
+         InlineKeyboardButton("3 oy", callback_data="inst_3"),
+         InlineKeyboardButton("6 oy", callback_data="inst_6")],
+        [InlineKeyboardButton("12 oy", callback_data="inst_12")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def debt_list_keyboard(debts, page=0):
     keyboard = []
-    for i, channel in enumerate(REQUIRED_CHANNELS, 1):
-        channel_name = channel.replace('@', '')
-        keyboard.append([InlineKeyboardButton(
-            f"📢 {i}-Kanal: {channel_name}", 
-            url=f"https://t.me/{channel_name}"
-        )])
-    keyboard.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
+    for debt in debts[:10]:
+        status = "✅" if debt['is_paid'] else "⏳"
+        text = f"{status} {debt['person_name']} - {debt['amount']:,.0f} {debt['currency']}"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"debt_{debt['id']}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_quality_keyboard():
-    """Sifat tanlash tugmalari"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📱 360p", callback_data="quality_360p"),
-            InlineKeyboardButton("📺 480p", callback_data="quality_480p"),
-        ],
-        [
-            InlineKeyboardButton("🖥 720p HD", callback_data="quality_720p"),
-            InlineKeyboardButton("🎬 1080p FHD", callback_data="quality_1080p"),
-        ],
-        [
-            InlineKeyboardButton("⭐ Eng yaxshi sifat", callback_data="quality_best"),
-        ]
-    ]
+def debt_action_keyboard(debt_id, is_paid=False):
+    keyboard = []
+    if not is_paid:
+        keyboard.append([InlineKeyboardButton("✅ To'landi", callback_data=f"mark_paid_{debt_id}")])
+    keyboard.append([InlineKeyboardButton("🗑 O'chirish", callback_data=f"delete_debt_{debt_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_debts")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_video_keyboard():
-    """Video tugmalari"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📂 Saqlash", callback_data="save_playlist"),
-            InlineKeyboardButton("🎵 Musiqa", callback_data="download_audio"),
-        ],
-        [
-            InlineKeyboardButton("📤 Do'stlarga ulashish", switch_inline_query="")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# ============== UTILS ==============
+def format_money(amount, currency):
+    if currency == "UZS":
+        return f"{amount:,.0f} so'm"
+    return f"${amount:,.2f}"
 
-def get_main_keyboard():
-    """Asosiy menyu tugmalari"""
-    keyboard = [
-        [
-            InlineKeyboardButton("📂 Playlistim", callback_data="show_playlist"),
-            InlineKeyboardButton("❓ Yordam", callback_data="help")
-        ],
-        [
-            InlineKeyboardButton("📢 Kanal", url="https://t.me/oltiariq_999_magazin_oqboyra")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def parse_amount(text):
+    text = text.strip().upper()
+    if '$' in text:
+        amount = re.sub(r'[^\d.]', '', text)
+        return float(amount) if amount else None, 'USD'
+    if 'USD' in text:
+        amount = re.sub(r'[^\d.]', '', text.replace('USD', ''))
+        return float(amount) if amount else None, 'USD'
+    if 'UZS' in text or "SO'M" in text or "SOM" in text:
+        amount = re.sub(r'[^\d.]', '', text)
+        return float(amount) if amount else None, 'UZS'
+    amount = re.sub(r'[^\d.]', '', text)
+    return (float(amount), 'UZS') if amount else (None, None)
+
+def parse_date(text):
+    formats = ['%d.%m.%Y', '%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d.%m.%y']
+    for fmt in formats:
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def format_date(d):
+    if d is None:
+        return "Belgilanmagan"
+    if isinstance(d, str):
+        d = datetime.fromisoformat(d).date()
+    return d.strftime('%d.%m.%Y')
+
+def days_until(target_date):
+    if isinstance(target_date, str):
+        target_date = datetime.fromisoformat(target_date).date()
+    return (target_date - date.today()).days
+
+# ============== DATABASE ==============
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                full_name TEXT,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS debts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'UZS',
+                debt_type TEXT NOT NULL,
+                payment_type TEXT DEFAULT 'one_time',
+                given_date DATE,
+                due_date DATE,
+                is_paid INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                description TEXT,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'UZS',
+                category TEXT,
+                expense_date DATE DEFAULT CURRENT_DATE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+async def get_or_create_user(telegram_id, full_name, username=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        user = await cursor.fetchone()
+        if user:
+            return dict(user)
+        await db.execute("INSERT INTO users (telegram_id, full_name, username) VALUES (?, ?, ?)",
+                        (telegram_id, full_name, username))
+        await db.commit()
+        cursor = await db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        return dict(await cursor.fetchone())
+
+async def add_debt(user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            INSERT INTO debts (user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date))
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_debts_by_type(user_id, debt_type):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM debts WHERE user_id = ? AND debt_type = ? AND is_paid = 0
+            ORDER BY due_date ASC
+        """, (user_id, debt_type))
+        return [dict(row) for row in await cursor.fetchall()]
+
+async def get_debt_by_id(debt_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM debts WHERE id = ?", (debt_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def mark_debt_paid(debt_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE debts SET is_paid = 1 WHERE id = ?", (debt_id,))
+        await db.commit()
+
+async def delete_debt(debt_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM debts WHERE id = ?", (debt_id,))
+        await db.commit()
+
+async def add_expense(user_id, description, amount, currency, category):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO daily_expenses (user_id, description, amount, currency, category, expense_date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, description, amount, currency, category, date.today()))
+        await db.commit()
+
+async def get_statistics(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        stats = {'given_active': {}, 'taken_active': {}, 'given_count': 0, 'taken_count': 0, 
+                 'monthly_expenses': {}, 'today_expenses': {}}
+        cursor = await db.execute("""
+            SELECT currency, SUM(amount) FROM debts WHERE user_id = ? AND debt_type = 'given' AND is_paid = 0 GROUP BY currency
+        """, (user_id,))
+        stats['given_active'] = {row[0]: row[1] for row in await cursor.fetchall()}
+        
+        cursor = await db.execute("""
+            SELECT currency, SUM(amount) FROM debts WHERE user_id = ? AND debt_type = 'taken' AND is_paid = 0 GROUP BY currency
+        """, (user_id,))
+        stats['taken_active'] = {row[0]: row[1] for row in await cursor.fetchall()}
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM debts WHERE user_id = ? AND debt_type = 'given' AND is_paid = 0", (user_id,))
+        stats['given_count'] = (await cursor.fetchone())[0]
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM debts WHERE user_id = ? AND debt_type = 'taken' AND is_paid = 0", (user_id,))
+        stats['taken_count'] = (await cursor.fetchone())[0]
+        
+        today = date.today()
+        cursor = await db.execute("""
+            SELECT currency, SUM(amount) FROM daily_expenses WHERE user_id = ? AND expense_date = ? GROUP BY currency
+        """, (user_id, today))
+        stats['today_expenses'] = {row[0]: row[1] for row in await cursor.fetchall()}
+        
+        cursor = await db.execute("""
+            SELECT currency, SUM(amount) FROM daily_expenses WHERE user_id = ? AND strftime('%Y-%m', expense_date) = ? GROUP BY currency
+        """, (user_id, today.strftime('%Y-%m')))
+        stats['monthly_expenses'] = {row[0]: row[1] for row in await cursor.fetchall()}
+        
+        return stats
+
+# ============== HANDLERS ==============
+WELCOME_MESSAGE = """
+🎉 <b>Assalomu alaykum, {name}!</b>
+
+🤖 Men sizning shaxsiy <b>Hisobchi Bot</b>ingizman!
+
+✨ <b>Mening afzalliklarim:</b>
+• 💰 Qarz oldi-berdi hisobini yuritish
+• 📝 Kunlik harajatlarni nazorat qilish
+• 📊 Statistika va hisobotlar
+
+<i>Quyidagi tugmalardan birini tanlang:</i>
+"""
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start buyrug'i"""
     user = update.effective_user
-    await add_user(user.id, user.username, user.first_name)
-    
-    welcome_msg = MESSAGES["welcome"].format(name=user.first_name or "do'stim")
-    await update.message.reply_text(
-        welcome_msg,
-        reply_markup=get_channel_keyboard(),
-        parse_mode="HTML"
-    )
+    await get_or_create_user(user.id, user.full_name, user.username)
+    await update.message.reply_html(WELCOME_MESSAGE.format(name=user.first_name), reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Yordam buyrug'i"""
-    await update.message.reply_text(
-        MESSAGES["help"],
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard()
-    )
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Bekor qilindi.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
 
-async def playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Playlist ko'rish"""
-    user_id = update.effective_user.id
-    playlist = await get_playlist(user_id)
-    
-    if not playlist:
-        await update.message.reply_text(
-            MESSAGES["playlist_empty"],
-            parse_mode="HTML"
-        )
-        return
-    
-    await update.message.reply_text(
-        MESSAGES["playlist_header"],
-        parse_mode="HTML"
-    )
-    
-    for item in playlist[:10]:
-        try:
-            if item['file_type'] == 'video':
-                await context.bot.send_video(
-                    chat_id=user_id,
-                    video=item['file_id'],
-                    caption=f"📹 {item['title']}"
-                )
-            else:
-                await context.bot.send_audio(
-                    chat_id=user_id,
-                    audio=item['file_id'],
-                    caption=f"🎵 {item['title']}"
-                )
-        except Exception as e:
-            logger.error(f"Playlist yuborishda xatolik: {e}")
+# DEBT HANDLERS
+async def debt_given_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['debt_type'] = 'given'
+    context.user_data['debt_data'] = {}
+    await update.message.reply_text("💰 <b>Qarz berdim</b>\n\nQarz oluvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+    return DEBT_NAME
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """URL qayta ishlash - sifat tanlash"""
-    user = update.effective_user
-    text = update.message.text
-    
-    # URL ajratib olish
-    url = extract_url(text)
-    if not url or not is_valid_url(url):
-        await update.message.reply_text(
-            MESSAGES["invalid_url"],
-            parse_mode="HTML"
-        )
-        return
-    
-    # URL'ni saqlash
-    user_last_url[user.id] = url
-    
-    # Sifat tanlash menyusi
-    quality_msg = """
-╔══════════════════════════════╗
-   🎬 <b>SIFATNI TANLANG</b>
-╚══════════════════════════════╝
+async def debt_taken_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['debt_type'] = 'taken'
+    context.user_data['debt_data'] = {}
+    await update.message.reply_text("💸 <b>Qarz oldim</b>\n\nQarz beruvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+    return DEBT_NAME
 
-📹 Video uchun sifatni tanlang:
+async def debt_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("❌ Ism juda qisqa!")
+        return DEBT_NAME
+    context.user_data['debt_data']['person_name'] = name
+    await update.message.reply_text(f"👤 <b>{name}</b>\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>", parse_mode='HTML')
+    return DEBT_AMOUNT
 
-▫️ <b>360p</b> - Kichik hajm (~5-15 MB)
-▫️ <b>480p</b> - O'rta sifat (~15-30 MB)
-▫️ <b>720p HD</b> - Yaxshi sifat (~30-60 MB)
-▫️ <b>1080p FHD</b> - Yuqori sifat (~60-150 MB)
-▫️ <b>Eng yaxshi</b> - Maksimal sifat
+async def debt_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount, currency = parse_amount(update.message.text)
+    if amount is None or amount <= 0:
+        await update.message.reply_text("❌ Summani to'g'ri kiriting!")
+        return DEBT_AMOUNT
+    context.user_data['debt_data']['amount'] = amount
+    context.user_data['debt_data']['currency'] = currency
+    await update.message.reply_text(f"💵 {format_money(amount, currency)}\n\nTo'lov turini tanlang:", 
+                                   parse_mode='HTML', reply_markup=payment_type_keyboard())
+    return DEBT_PAYMENT_TYPE
 
-⚠️ <i>Katta fayllar (50MB+) biroz sekin yuklanadi</i>
+async def debt_payment_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['debt_data']['payment_type'] = 'one_time' if query.data == "payment_one_time" else 'installment'
+    await query.edit_message_text("Qarz berilgan sanani tanlang:", reply_markup=date_keyboard())
+    return DEBT_GIVEN_DATE
+
+async def debt_given_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "date_today":
+        context.user_data['debt_data']['given_date'] = date.today()
+        await query.edit_message_text(f"📅 Berilgan: {format_date(date.today())}\n\nQaytarish muddatini kiriting:\n<i>Masalan: 25.02.2026</i>", parse_mode='HTML')
+        return DEBT_DUE_DATE
+    await query.edit_message_text("Berilgan sanani kiriting:\n<i>Masalan: 17.01.2026</i>", parse_mode='HTML')
+    return DEBT_GIVEN_DATE
+
+async def debt_given_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_date(update.message.text)
+    if not parsed:
+        await update.message.reply_text("❌ Sanani to'g'ri kiriting!")
+        return DEBT_GIVEN_DATE
+    context.user_data['debt_data']['given_date'] = parsed
+    await update.message.reply_text(f"📅 Berilgan: {format_date(parsed)}\n\nQaytarish muddatini kiriting:", parse_mode='HTML')
+    return DEBT_DUE_DATE
+
+async def debt_due_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_date(update.message.text)
+    if not parsed:
+        await update.message.reply_text("❌ Sanani to'g'ri kiriting!")
+        return DEBT_DUE_DATE
+    context.user_data['debt_data']['due_date'] = parsed
+    
+    if context.user_data['debt_data']['payment_type'] == 'installment':
+        await update.message.reply_text("Necha oyga bo'lib to'lanadi?", reply_markup=installment_count_keyboard())
+        return DEBT_INSTALLMENTS
+    
+    return await show_debt_confirmation(update, context)
+
+async def debt_installments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    months = int(query.data.replace("inst_", ""))
+    context.user_data['debt_data']['installment_months'] = months
+    return await show_debt_confirmation(update, context, is_callback=True)
+
+async def show_debt_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False):
+    data = context.user_data['debt_data']
+    debt_type = context.user_data['debt_type']
+    type_text = "💰 QARZ BERDIM" if debt_type == 'given' else "💸 QARZ OLDIM"
+    
+    text = f"""
+<b>{type_text}</b>
+
+👤 <b>Shaxs:</b> {data['person_name']}
+💵 <b>Summa:</b> {format_money(data['amount'], data['currency'])}
+📅 <b>Berilgan:</b> {format_date(data['given_date'])}
+⏰ <b>Muddat:</b> {format_date(data['due_date'])}
+
+<b>Tasdiqlaysizmi?</b>
 """
-    
-    await update.message.reply_text(
-        quality_msg,
-        parse_mode="HTML",
-        reply_markup=get_quality_keyboard()
-    )
+    if is_callback:
+        await update.callback_query.edit_message_text(text, parse_mode='HTML', reply_markup=confirm_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode='HTML', reply_markup=confirm_keyboard())
+    return DEBT_CONFIRM
 
-async def download_and_send(query, context, user_id: int, url: str, quality: str):
-    """Video yuklab yuborish"""
-    
-    status_msg = await query.message.reply_text(
-        f"⏳ <b>Yuklanmoqda... ({quality})</b>\n\nIltimos, kuting...",
-        parse_mode="HTML"
-    )
-    
-    try:
-        # Video yuklab olish
-        result = await download_video(url, user_id, quality)
-        
-        if not result['success']:
-            error_text = f"""
-❌ <b>Xatolik!</b>
-
-{result.get('error', 'Video yuklab olinmadi')}
-
-💡 <b>Maslahat:</b>
-▫️ Boshqa sifatni tanlang
-▫️ Video mavjudligini tekshiring
-"""
-            await status_msg.edit_text(error_text, parse_mode="HTML")
-            return
-        
-        file_path = result['file_path']
-        file_size_mb = result['file_size'] / (1024 * 1024)
-        
-        # Fayl hajmi haqida xabar
-        if file_size_mb > 50:
-            await status_msg.edit_text(
-                f"📤 <b>Yuborilmoqda...</b>\n\nHajmi: {file_size_mb:.1f} MB\n⚠️ Katta fayl, biroz kuting...",
-                parse_mode="HTML"
-            )
-        else:
-            await status_msg.edit_text(
-                f"📤 <b>Yuborilmoqda...</b>\n\nHajmi: {file_size_mb:.1f} MB",
-                parse_mode="HTML"
-            )
-        
-        # Caption
-        caption = f"""
-🎬 <b>{result['title']}</b>
-
-📊 Sifat: {quality}
-📁 Hajmi: {file_size_mb:.1f} MB
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-📥 @OLTIN_SAQLAYDI_BOT orqali yuklandi
-"""
-        
-        # Rasm yoki Video yuborish
-        if result.get('is_photo'):
-            with open(file_path, 'rb') as photo_file:
-                sent_message = await query.message.reply_photo(
-                    photo=photo_file,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=get_video_keyboard()
-                )
-            
-            context.user_data['last_video'] = {
-                'file_id': sent_message.photo[-1].file_id,
-                'title': result['title'],
-                'url': url,
-                'is_photo': True
-            }
-        else:
-            with open(file_path, 'rb') as video_file:
-                sent_message = await query.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=get_video_keyboard(),
-                    supports_streaming=True
-                )
-            
-            context.user_data['last_video'] = {
-                'file_id': sent_message.video.file_id,
-                'title': result['title'],
-                'url': url,
-                'is_photo': False
-            }
-        
-        await status_msg.delete()
-        cleanup_file(file_path)
-        
-    except Exception as e:
-        logger.error(f"Video yuborishda xatolik: {e}")
-        
-        # 50MB dan katta bo'lsa maxsus xabar
-        if "Request Entity Too Large" in str(e) or "file is too big" in str(e).lower():
-            await status_msg.edit_text(
-                f"""
-❌ <b>Fayl juda katta!</b>
-
-Telegram 50MB dan katta fayllarni qabul qilmaydi.
-
-💡 <b>Yechim:</b>
-Pastroq sifatni tanlang (360p yoki 480p)
-""",
-                parse_mode="HTML",
-                reply_markup=get_quality_keyboard()
-            )
-        else:
-            await status_msg.edit_text(
-                MESSAGES["download_error"],
-                parse_mode="HTML"
-            )
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback tugmalar"""
+async def debt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user = query.from_user
-    data = query.data
+    if query.data == "confirm_no":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Bekor qilindi.")
+        await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
     
-    if data == "check_sub":
-        await query.edit_message_text(
-            MESSAGES["subscribed"],
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
-        )
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    data = context.user_data['debt_data']
     
-    # Sifat tanlash
-    elif data.startswith("quality_"):
-        quality = data.replace("quality_", "")
-        url = user_last_url.get(user.id)
-        
-        if not url:
-            await query.answer("❌ URL topilmadi. Iltimos, qaytadan yuboring.", show_alert=True)
-            return
-        
-        # Sifatni saqlash
-        user_selected_quality[user.id] = quality
-        
-        # Yuklab yuborish
-        await download_and_send(query, context, user.id, url, quality)
+    await add_debt(db_user['id'], data['person_name'], data['amount'], data['currency'],
+                   context.user_data['debt_type'], data['payment_type'], data['given_date'], data['due_date'])
     
-    elif data == "save_playlist":
-        last_video = context.user_data.get('last_video')
-        if last_video:
-            await add_to_playlist(
-                user_id=user.id,
-                file_id=last_video['file_id'],
-                file_type='photo' if last_video.get('is_photo') else 'video',
-                title=last_video['title'],
-                url=last_video['url']
-            )
-            await query.answer("✅ Playlistga saqlandi!", show_alert=True)
-        else:
-            await query.answer("❌ Video topilmadi", show_alert=True)
-    
-    elif data == "download_audio":
-        url = user_last_url.get(user.id)
-        if not url:
-            await query.answer("❌ URL topilmadi", show_alert=True)
-            return
-        
-        await query.answer("🎵 Musiqa yuklanmoqda...")
-        status_msg = await query.message.reply_text(
-            "⏳ <b>Musiqa yuklab olinmoqda...</b>",
-            parse_mode="HTML"
-        )
-        
-        try:
-            result = await download_audio(url, user.id)
-            
-            if result['success']:
-                caption = f"""
-🎵 <b>{result['title']}</b>
+    context.user_data.clear()
+    await query.edit_message_text("✅ <b>Saqlandi!</b>", parse_mode='HTML')
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-📥 @OLTIN_SAQLAYDI_BOT orqali yuklandi
+# EXPENSE HANDLERS
+async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['expense_data'] = {}
+    await update.message.reply_text("📝 <b>Kunlik harajat</b>\n\nTavsifini kiriting:\n<i>Masalan: Tushlik, Taksi</i>", parse_mode='HTML')
+    return EXPENSE_DESCRIPTION
+
+async def expense_description_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['expense_data']['description'] = update.message.text.strip()
+    await update.message.reply_text("Summani kiriting:\n<i>Masalan: 50000, 10 USD</i>", parse_mode='HTML')
+    return EXPENSE_AMOUNT
+
+async def expense_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount, currency = parse_amount(update.message.text)
+    if amount is None or amount <= 0:
+        await update.message.reply_text("❌ Summani to'g'ri kiriting!")
+        return EXPENSE_AMOUNT
+    context.user_data['expense_data']['amount'] = amount
+    context.user_data['expense_data']['currency'] = currency
+    await update.message.reply_text("Kategoriya tanlang:", reply_markup=expense_category_keyboard())
+    return EXPENSE_CATEGORY
+
+async def expense_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    data = context.user_data['expense_data']
+    category = query.data.replace("cat_", "")
+    
+    await add_expense(db_user['id'], data['description'], data['amount'], data['currency'], category)
+    context.user_data.clear()
+    
+    await query.edit_message_text(f"✅ <b>Saqlandi!</b>\n\n📝 {data['description']}\n💵 {format_money(data['amount'], data['currency'])}", parse_mode='HTML')
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+# VIEW HANDLERS
+async def my_debts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📋 <b>Mening qarzlarim</b>", parse_mode='HTML', reply_markup=my_debts_keyboard())
+
+async def view_debts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    
+    debt_type = 'given' if query.data == "view_given" else 'taken'
+    title = "💰 Bergan qarzlarim" if debt_type == 'given' else "💸 Olgan qarzlarim"
+    context.user_data['current_debt_type'] = debt_type
+    
+    debts = await get_debts_by_type(db_user['id'], debt_type)
+    
+    if not debts:
+        await query.edit_message_text(f"{title}\n\n📭 Qarz yo'q.", reply_markup=my_debts_keyboard())
+        return
+    
+    total_usd = sum(d['amount'] for d in debts if d['currency'] == 'USD')
+    total_uzs = sum(d['amount'] for d in debts if d['currency'] == 'UZS')
+    
+    text = f"<b>{title}</b>\n\n"
+    if total_usd: text += f"💵 USD: {format_money(total_usd, 'USD')}\n"
+    if total_uzs: text += f"💵 UZS: {format_money(total_uzs, 'UZS')}\n"
+    text += f"\n📌 {len(debts)} ta qarz"
+    
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=debt_list_keyboard(debts))
+
+async def view_debt_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    debt_id = int(query.data.replace("debt_", ""))
+    debt = await get_debt_by_id(debt_id)
+    
+    if not debt:
+        await query.edit_message_text("❌ Qarz topilmadi.")
+        return
+    
+    days = days_until(debt['due_date'])
+    status = "✅ To'langan" if debt['is_paid'] else f"📆 {days} kun qoldi" if days >= 0 else f"🔴 {abs(days)} kun o'tdi"
+    
+    text = f"""
+👤 <b>{debt['person_name']}</b>
+💰 {format_money(debt['amount'], debt['currency'])}
+📅 Berilgan: {format_date(debt['given_date'])}
+⏰ Muddat: {format_date(debt['due_date'])}
+{status}
 """
-                
-                with open(result['file_path'], 'rb') as audio_file:
-                    sent_audio = await query.message.reply_audio(
-                        audio=audio_file,
-                        caption=caption,
-                        parse_mode="HTML"
-                    )
-                
-                context.user_data['last_audio'] = {
-                    'file_id': sent_audio.audio.file_id,
-                    'title': result['title'],
-                    'url': url
-                }
-                
-                await status_msg.delete()
-                cleanup_file(result['file_path'])
-            else:
-                await status_msg.edit_text(
-                    "❌ Musiqa yuklab olinmadi. FFmpeg o'rnatilmagan bo'lishi mumkin.",
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            logger.error(f"Audio xatolik: {e}")
-            await status_msg.edit_text(
-                MESSAGES["download_error"],
-                parse_mode="HTML"
-            )
-    
-    elif data == "show_playlist":
-        playlist = await get_playlist(user.id)
-        
-        if not playlist:
-            await query.answer(MESSAGES["playlist_empty"], show_alert=True)
-            return
-        
-        await query.message.reply_text(
-            MESSAGES["playlist_header"],
-            parse_mode="HTML"
-        )
-        
-        for item in playlist[:10]:
-            try:
-                if item['file_type'] == 'video':
-                    await context.bot.send_video(
-                        chat_id=user.id,
-                        video=item['file_id'],
-                        caption=f"📹 {item['title']}"
-                    )
-                elif item['file_type'] == 'photo':
-                    await context.bot.send_photo(
-                        chat_id=user.id,
-                        photo=item['file_id'],
-                        caption=f"📸 {item['title']}"
-                    )
-                else:
-                    await context.bot.send_audio(
-                        chat_id=user.id,
-                        audio=item['file_id'],
-                        caption=f"🎵 {item['title']}"
-                    )
-            except Exception as e:
-                logger.error(f"Playlist item xatolik: {e}")
-    
-    elif data == "help":
-        await query.message.reply_text(
-            MESSAGES["help"],
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
-        )
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=debt_action_keyboard(debt_id, debt['is_paid']))
 
-async def post_init(application):
-    """Bot ishga tushganda"""
-    await init_db()
-    logger.info("Bot ishga tushdi!")
+async def mark_debt_paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    debt_id = int(query.data.replace("mark_paid_", ""))
+    await mark_debt_paid(debt_id)
+    await query.edit_message_text("✅ <b>To'langan deb belgilandi!</b>", parse_mode='HTML')
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
 
+async def delete_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    debt_id = int(query.data.replace("delete_debt_", ""))
+    await delete_debt(debt_id)
+    await query.edit_message_text("🗑 <b>O'chirildi!</b>", parse_mode='HTML')
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+
+async def statistics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    stats = await get_statistics(db_user['id'])
+    
+    text = "📊 <b>STATISTIKA</b>\n\n"
+    text += "💰 <b>Bergan qarzlar:</b>\n"
+    if stats['given_active']:
+        for c, a in stats['given_active'].items(): text += f"   • {format_money(a, c)}\n"
+    else:
+        text += "   Yo'q\n"
+    
+    text += "\n💸 <b>Olgan qarzlar:</b>\n"
+    if stats['taken_active']:
+        for c, a in stats['taken_active'].items(): text += f"   • {format_money(a, c)}\n"
+    else:
+        text += "   Yo'q\n"
+    
+    text += "\n📝 <b>Bugungi harajat:</b>\n"
+    if stats['today_expenses']:
+        for c, a in stats['today_expenses'].items(): text += f"   • {format_money(a, c)}\n"
+    else:
+        text += "   Yo'q\n"
+    
+    text += "\n🗓 <b>Oylik harajat:</b>\n"
+    if stats['monthly_expenses']:
+        for c, a in stats['monthly_expenses'].items(): text += f"   • {format_money(a, c)}\n"
+    else:
+        text += "   Yo'q\n"
+    
+    await update.message.reply_html(text)
+
+async def back_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("✅")
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+
+async def back_debts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📋 <b>Mening qarzlarim</b>", parse_mode='HTML', reply_markup=my_debts_keyboard())
+
+# ============== MAIN ==============
 def main():
-    """Asosiy funksiya"""
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("playlist", playlist_command))
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    # Debt given handler
+    debt_given_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r'^💰 Qarz berdim$'), debt_given_start)],
+        states={
+            DEBT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_name_received)],
+            DEBT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_amount_received)],
+            DEBT_PAYMENT_TYPE: [CallbackQueryHandler(debt_payment_type_callback, pattern=r'^payment_')],
+            DEBT_GIVEN_DATE: [
+                CallbackQueryHandler(debt_given_date_callback, pattern=r'^date_'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, debt_given_date_text)
+            ],
+            DEBT_DUE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_due_date_received)],
+            DEBT_INSTALLMENTS: [CallbackQueryHandler(debt_installments_callback, pattern=r'^inst_')],
+            DEBT_CONFIRM: [CallbackQueryHandler(debt_confirm_callback, pattern=r'^confirm_')]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command), CommandHandler('start', start_command)],
+        allow_reentry=True
+    )
     
-    logger.info("Bot ishga tushmoqda...")
+    # Debt taken handler
+    debt_taken_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r'^💸 Qarz oldim$'), debt_taken_start)],
+        states={
+            DEBT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_name_received)],
+            DEBT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_amount_received)],
+            DEBT_PAYMENT_TYPE: [CallbackQueryHandler(debt_payment_type_callback, pattern=r'^payment_')],
+            DEBT_GIVEN_DATE: [
+                CallbackQueryHandler(debt_given_date_callback, pattern=r'^date_'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, debt_given_date_text)
+            ],
+            DEBT_DUE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_due_date_received)],
+            DEBT_INSTALLMENTS: [CallbackQueryHandler(debt_installments_callback, pattern=r'^inst_')],
+            DEBT_CONFIRM: [CallbackQueryHandler(debt_confirm_callback, pattern=r'^confirm_')]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command), CommandHandler('start', start_command)],
+        allow_reentry=True
+    )
+    
+    # Expense handler
+    expense_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r'^📝 Kunlik harajat$'), expense_start)],
+        states={
+            EXPENSE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_description_received)],
+            EXPENSE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount_received)],
+            EXPENSE_CATEGORY: [CallbackQueryHandler(expense_category_callback, pattern=r'^cat_')]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command), CommandHandler('start', start_command)],
+        allow_reentry=True
+    )
+    
+    # Add handlers
+    application.add_handler(CommandHandler('start', start_command))
+    application.add_handler(CommandHandler('cancel', cancel_command))
+    application.add_handler(debt_given_handler)
+    application.add_handler(debt_taken_handler)
+    application.add_handler(expense_handler)
+    application.add_handler(MessageHandler(filters.Regex(r'^📊 Statistika$'), statistics_handler))
+    application.add_handler(MessageHandler(filters.Regex(r'^📋 Mening qarzlarim$'), my_debts_handler))
+    application.add_handler(CallbackQueryHandler(view_debts_callback, pattern=r'^view_'))
+    application.add_handler(CallbackQueryHandler(view_debt_detail_callback, pattern=r'^debt_\d+$'))
+    application.add_handler(CallbackQueryHandler(mark_debt_paid_callback, pattern=r'^mark_paid_'))
+    application.add_handler(CallbackQueryHandler(delete_debt_callback, pattern=r'^delete_debt_'))
+    application.add_handler(CallbackQueryHandler(back_main_callback, pattern=r'^back_main$'))
+    application.add_handler(CallbackQueryHandler(back_debts_callback, pattern=r'^back_debts$'))
+    
+    # Initialize DB
+    async def post_init(app):
+        await init_db()
+        logger.info("Database ready!")
+    
+    application.post_init = post_init
+    
+    logger.info("Hisobchi Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
