@@ -27,9 +27,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # Conversation states
-(DEBT_NAME, DEBT_AMOUNT, DEBT_PAYMENT_TYPE, DEBT_GIVEN_DATE, 
- DEBT_DUE_DATE, DEBT_INSTALLMENTS, DEBT_CONFIRM) = range(7)
-EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(7, 10)
+(DEBT_SELECT_CONTACT, DEBT_NAME, DEBT_PHONE, DEBT_AMOUNT, DEBT_PAYMENT_TYPE, DEBT_GIVEN_DATE, 
+ DEBT_DUE_DATE, DEBT_INSTALLMENTS, DEBT_CONFIRM) = range(9)
+EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(9, 12)
 
 # ============== KEYBOARDS ==============
 def main_menu_keyboard():
@@ -164,6 +164,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 person_name TEXT NOT NULL,
+                phone_number TEXT,
                 amount REAL NOT NULL,
                 currency TEXT DEFAULT 'UZS',
                 debt_type TEXT NOT NULL,
@@ -175,6 +176,11 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Add phone_number column if not exists (for existing databases)
+        try:
+            await db.execute("ALTER TABLE debts ADD COLUMN phone_number TEXT")
+        except:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS daily_expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,14 +208,25 @@ async def get_or_create_user(telegram_id, full_name, username=None):
         cursor = await db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
         return dict(await cursor.fetchone())
 
-async def add_debt(user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date):
+async def add_debt(user_id, person_name, phone_number, amount, currency, debt_type, payment_type, given_date, due_date):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
-            INSERT INTO debts (user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, person_name, amount, currency, debt_type, payment_type, given_date, due_date))
+            INSERT INTO debts (user_id, person_name, phone_number, amount, currency, debt_type, payment_type, given_date, due_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, person_name, phone_number, amount, currency, debt_type, payment_type, given_date, due_date))
         await db.commit()
         return cursor.lastrowid
+
+async def get_previous_contacts(user_id):
+    """Get list of previous contacts (people user has given/taken debts from)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT DISTINCT person_name, phone_number FROM debts 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+            LIMIT 10
+        """, (user_id,))
+        return await cursor.fetchall()
 
 async def get_debts_by_type(user_id, debt_type):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -304,17 +321,79 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # DEBT HANDLERS
+def previous_contacts_keyboard(contacts):
+    """Create keyboard with previous contacts"""
+    keyboard = []
+    for name, phone in contacts:
+        phone_text = f" ({phone})" if phone else ""
+        keyboard.append([InlineKeyboardButton(f"👤 {name}{phone_text}", callback_data=f"contact_{name}|{phone or ''}")])
+    keyboard.append([InlineKeyboardButton("➕ Yangi kontakt", callback_data="contact_new")])
+    return InlineKeyboardMarkup(keyboard)
+
 async def debt_given_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['debt_type'] = 'given'
     context.user_data['debt_data'] = {}
-    await update.message.reply_text("💰 <b>Qarz berdim</b>\n\nQarz oluvchining <b>ismini</b> kiriting:", parse_mode='HTML')
-    return DEBT_NAME
+    
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    contacts = await get_previous_contacts(db_user['id'])
+    
+    if contacts:
+        await update.message.reply_text(
+            "💰 <b>Qarz berdim</b>\n\nAvvalgi kontaktlardan tanlang yoki yangi kiriting:",
+            parse_mode='HTML',
+            reply_markup=previous_contacts_keyboard(contacts)
+        )
+        return DEBT_SELECT_CONTACT
+    else:
+        await update.message.reply_text("💰 <b>Qarz berdim</b>\n\nQarz oluvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+        return DEBT_NAME
 
 async def debt_taken_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['debt_type'] = 'taken'
     context.user_data['debt_data'] = {}
-    await update.message.reply_text("💸 <b>Qarz oldim</b>\n\nQarz beruvchining <b>ismini</b> kiriting:", parse_mode='HTML')
-    return DEBT_NAME
+    
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    contacts = await get_previous_contacts(db_user['id'])
+    
+    if contacts:
+        await update.message.reply_text(
+            "💸 <b>Qarz oldim</b>\n\nAvvalgi kontaktlardan tanlang yoki yangi kiriting:",
+            parse_mode='HTML',
+            reply_markup=previous_contacts_keyboard(contacts)
+        )
+        return DEBT_SELECT_CONTACT
+    else:
+        await update.message.reply_text("💸 <b>Qarz oldim</b>\n\nQarz beruvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+        return DEBT_NAME
+
+async def debt_select_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "contact_new":
+        debt_type = context.user_data['debt_type']
+        if debt_type == 'given':
+            await query.edit_message_text("💰 <b>Qarz berdim</b>\n\nQarz oluvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+        else:
+            await query.edit_message_text("💸 <b>Qarz oldim</b>\n\nQarz beruvchining <b>ismini</b> kiriting:", parse_mode='HTML')
+        return DEBT_NAME
+    
+    # Parse selected contact
+    data = query.data.replace("contact_", "")
+    parts = data.split("|")
+    name = parts[0]
+    phone = parts[1] if len(parts) > 1 and parts[1] else None
+    
+    context.user_data['debt_data']['person_name'] = name
+    context.user_data['debt_data']['phone_number'] = phone
+    
+    await query.edit_message_text(
+        f"👤 <b>{name}</b>\n📱 {phone or 'Raqam yo\\'q'}\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>",
+        parse_mode='HTML'
+    )
+    return DEBT_AMOUNT
 
 async def debt_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
@@ -322,7 +401,32 @@ async def debt_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Ism juda qisqa!")
         return DEBT_NAME
     context.user_data['debt_data']['person_name'] = name
-    await update.message.reply_text(f"👤 <b>{name}</b>\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>", parse_mode='HTML')
+    await update.message.reply_text(
+        f"👤 <b>{name}</b>\n\n📱 Telefon raqamini kiriting:\n<i>Masalan: +998901234567</i>\n\n<i>O'tkazib yuborish uchun \"yo'q\" yozing</i>",
+        parse_mode='HTML'
+    )
+    return DEBT_PHONE
+
+async def debt_phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    
+    # Skip if user types "yo'q" or similar
+    if phone.lower() in ["yo'q", "yoq", "yo`q", "-", "0"]:
+        context.user_data['debt_data']['phone_number'] = None
+    else:
+        # Clean phone number
+        phone = re.sub(r'[^\d+]', '', phone)
+        if len(phone) < 9:
+            await update.message.reply_text("❌ Telefon raqamini to'g'ri kiriting!\n<i>Masalan: +998901234567</i>", parse_mode='HTML')
+            return DEBT_PHONE
+        context.user_data['debt_data']['phone_number'] = phone
+    
+    name = context.user_data['debt_data']['person_name']
+    phone_display = context.user_data['debt_data'].get('phone_number') or "Kiritilmadi"
+    await update.message.reply_text(
+        f"👤 <b>{name}</b>\n📱 {phone_display}\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>",
+        parse_mode='HTML'
+    )
     return DEBT_AMOUNT
 
 async def debt_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -386,11 +490,13 @@ async def show_debt_confirmation(update: Update, context: ContextTypes.DEFAULT_T
     data = context.user_data['debt_data']
     debt_type = context.user_data['debt_type']
     type_text = "💰 QARZ BERDIM" if debt_type == 'given' else "💸 QARZ OLDIM"
+    phone_display = data.get('phone_number') or "Kiritilmadi"
     
     text = f"""
 <b>{type_text}</b>
 
 👤 <b>Shaxs:</b> {data['person_name']}
+📱 <b>Telefon:</b> {phone_display}
 💵 <b>Summa:</b> {format_money(data['amount'], data['currency'])}
 📅 <b>Berilgan:</b> {format_date(data['given_date'])}
 ⏰ <b>Muddat:</b> {format_date(data['due_date'])}
@@ -417,7 +523,7 @@ async def debt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     db_user = await get_or_create_user(user.id, user.full_name, user.username)
     data = context.user_data['debt_data']
     
-    await add_debt(db_user['id'], data['person_name'], data['amount'], data['currency'],
+    await add_debt(db_user['id'], data['person_name'], data.get('phone_number'), data['amount'], data['currency'],
                    context.user_data['debt_type'], data['payment_type'], data['given_date'], data['due_date'])
     
     context.user_data.clear()
@@ -583,7 +689,9 @@ def main():
     debt_given_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^💰 Qarz berdim$'), debt_given_start)],
         states={
+            DEBT_SELECT_CONTACT: [CallbackQueryHandler(debt_select_contact_callback, pattern=r'^contact_')],
             DEBT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_name_received)],
+            DEBT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_phone_received)],
             DEBT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_amount_received)],
             DEBT_PAYMENT_TYPE: [CallbackQueryHandler(debt_payment_type_callback, pattern=r'^payment_')],
             DEBT_GIVEN_DATE: [
@@ -602,7 +710,9 @@ def main():
     debt_taken_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^💸 Qarz oldim$'), debt_taken_start)],
         states={
+            DEBT_SELECT_CONTACT: [CallbackQueryHandler(debt_select_contact_callback, pattern=r'^contact_')],
             DEBT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_name_received)],
+            DEBT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_phone_received)],
             DEBT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_amount_received)],
             DEBT_PAYMENT_TYPE: [CallbackQueryHandler(debt_payment_type_callback, pattern=r'^payment_')],
             DEBT_GIVEN_DATE: [
