@@ -4,3 +4,4 @@ python-version = "3.11"
 [deploy]
 startCommand = "python main.py"
 restartPolicyType = "always"
+
