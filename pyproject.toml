@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hisobchi-bot"
+version = "1.0.0"
+description = "O'zbekcha moliyaviy hisobchi Telegram bot"
+requires-python = ">=3.9"
+dependencies = [
+    "python-telegram-bot==20.7",
+    "aiosqlite==0.19.0",
+    "apscheduler==3.10.4",
+    "openpyxl==3.1.2",
+]
