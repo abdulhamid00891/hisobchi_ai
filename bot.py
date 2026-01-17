@@ -389,8 +389,9 @@ async def debt_select_contact_callback(update: Update, context: ContextTypes.DEF
     context.user_data['debt_data']['person_name'] = name
     context.user_data['debt_data']['phone_number'] = phone
     
+    phone_text = phone if phone else "Raqam yo'q"
     await query.edit_message_text(
-        f"👤 <b>{name}</b>\n📱 {phone or 'Raqam yo\\'q'}\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>",
+        f"👤 <b>{name}</b>\n📱 {phone_text}\n\nSummani kiriting:\n<i>Masalan: 100 USD, 500000</i>",
         parse_mode='HTML'
     )
     return DEBT_AMOUNT
