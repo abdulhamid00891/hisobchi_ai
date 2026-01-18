@@ -35,7 +35,7 @@ EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(12, 15)
 def main_menu_keyboard():
     keyboard = [
         [KeyboardButton("💰 Qarz berdim"), KeyboardButton("💸 Qarz oldim")],
-        [KeyboardButton("📝 Kunlik harajat")],
+        [KeyboardButton("📝 Kunlik harajat"), KeyboardButton("📋 Harajatlar tarixi")],
         [KeyboardButton("📊 Statistika"), KeyboardButton("📋 Mening qarzlarim")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -126,6 +126,31 @@ def delete_confirm_keyboard(debt_id):
     keyboard = [
         [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"confirm_delete_{debt_id}"),
          InlineKeyboardButton("❌ Yo'q", callback_data=f"debt_{debt_id}")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def expense_list_keyboard(expenses):
+    keyboard = []
+    category_emojis = {'food': '🍔', 'transport': '🚗', 'home': '🏠', 'clothes': '👕', 'health': '💊', 'other': '📦'}
+    for exp in expenses[:15]:
+        emoji = category_emojis.get(exp.get('category', 'other'), '📦')
+        exp_date = exp['expense_date'][:10] if exp.get('expense_date') else ""
+        text = f"{emoji} {exp['description'][:15]} - {exp['amount']:,.0f}"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"expense_{exp['id']}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def expense_action_keyboard(expense_id):
+    keyboard = [
+        [InlineKeyboardButton("🗑 O'chirish", callback_data=f"delete_expense_{expense_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="back_expenses")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def expense_delete_confirm_keyboard(expense_id):
+    keyboard = [
+        [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"confirm_del_exp_{expense_id}"),
+         InlineKeyboardButton("❌ Yo'q", callback_data=f"expense_{expense_id}")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -299,6 +324,28 @@ async def add_expense(user_id, description, amount, currency, category):
             INSERT INTO daily_expenses (user_id, description, amount, currency, category, expense_date)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (user_id, description, amount, currency, category, date.today()))
+        await db.commit()
+
+async def get_expenses(user_id, limit=20):
+    """Get recent expenses for a user"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM daily_expenses WHERE user_id = ? 
+            ORDER BY expense_date DESC, id DESC LIMIT ?
+        """, (user_id, limit))
+        return [dict(row) for row in await cursor.fetchall()]
+
+async def get_expense_by_id(expense_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM daily_expenses WHERE id = ?", (expense_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def delete_expense(expense_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM daily_expenses WHERE id = ?", (expense_id,))
         await db.commit()
 
 async def get_statistics(user_id):
@@ -897,6 +944,101 @@ async def back_debts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.edit_message_text("📋 <b>Mening qarzlarim</b>", parse_mode='HTML', reply_markup=my_debts_keyboard())
 
+# EXPENSE HISTORY HANDLERS
+async def expense_history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    expenses = await get_expenses(db_user['id'])
+    
+    if not expenses:
+        await update.message.reply_text("📋 <b>Harajatlar tarixi</b>\n\n📭 Harajat topilmadi.", parse_mode='HTML')
+        return
+    
+    # Calculate totals
+    total_uzs = sum(e['amount'] for e in expenses if e['currency'] == 'UZS')
+    total_usd = sum(e['amount'] for e in expenses if e['currency'] == 'USD')
+    
+    text = "📋 <b>Harajatlar tarixi</b>\n\n"
+    if total_uzs: text += f"💵 Jami UZS: {format_money(total_uzs, 'UZS')}\n"
+    if total_usd: text += f"💵 Jami USD: {format_money(total_usd, 'USD')}\n"
+    text += f"\n📌 {len(expenses)} ta harajat"
+    
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=expense_list_keyboard(expenses))
+
+async def view_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    expense_id = int(query.data.replace("expense_", ""))
+    expense = await get_expense_by_id(expense_id)
+    
+    if not expense:
+        await query.edit_message_text("❌ Harajat topilmadi.")
+        return
+    
+    category_names = {'food': 'Oziq-ovqat', 'transport': 'Transport', 'home': 'Uy-joy', 
+                      'clothes': 'Kiyim', 'health': "Sog'liq", 'other': 'Boshqa'}
+    cat_name = category_names.get(expense.get('category', 'other'), 'Boshqa')
+    exp_date = expense['expense_date'][:10] if expense.get('expense_date') else "Noma'lum"
+    
+    text = f"""
+📝 <b>Harajat</b>
+
+📦 <b>Kategoriya:</b> {cat_name}
+📄 <b>Tavsif:</b> {expense['description']}
+💰 <b>Summa:</b> {format_money(expense['amount'], expense['currency'])}
+📅 <b>Sana:</b> {exp_date}
+"""
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=expense_action_keyboard(expense_id))
+
+async def delete_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    expense_id = int(query.data.replace("delete_expense_", ""))
+    expense = await get_expense_by_id(expense_id)
+    
+    if not expense:
+        await query.edit_message_text("❌ Harajat topilmadi.")
+        return
+    
+    await query.edit_message_text(
+        f"⚠️ <b>O'chirishni tasdiqlang</b>\n\n📄 {expense['description']}\n💰 {format_money(expense['amount'], expense['currency'])}\n\nRostdan ham o'chirmoqchimisiz?",
+        parse_mode='HTML',
+        reply_markup=expense_delete_confirm_keyboard(expense_id)
+    )
+
+async def confirm_delete_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    expense_id = int(query.data.replace("confirm_del_exp_", ""))
+    await delete_expense(expense_id)
+    await query.edit_message_text("🗑 <b>O'chirildi!</b>", parse_mode='HTML')
+    await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+
+async def back_expenses_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.full_name, user.username)
+    expenses = await get_expenses(db_user['id'])
+    
+    if not expenses:
+        await query.edit_message_text("📋 <b>Harajatlar tarixi</b>\n\n📭 Harajat topilmadi.", parse_mode='HTML')
+        return
+    
+    total_uzs = sum(e['amount'] for e in expenses if e['currency'] == 'UZS')
+    total_usd = sum(e['amount'] for e in expenses if e['currency'] == 'USD')
+    
+    text = "📋 <b>Harajatlar tarixi</b>\n\n"
+    if total_uzs: text += f"💵 Jami UZS: {format_money(total_uzs, 'UZS')}\n"
+    if total_usd: text += f"💵 Jami USD: {format_money(total_usd, 'USD')}\n"
+    text += f"\n📌 {len(expenses)} ta harajat"
+    
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=expense_list_keyboard(expenses))
+
 # ============== MAIN ==============
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -985,12 +1127,17 @@ def main():
     application.add_handler(edit_handler)
     application.add_handler(MessageHandler(filters.Regex(r'^📊 Statistika$'), statistics_handler))
     application.add_handler(MessageHandler(filters.Regex(r'^📋 Mening qarzlarim$'), my_debts_handler))
+    application.add_handler(MessageHandler(filters.Regex(r'^📋 Harajatlar tarixi$'), expense_history_handler))
     application.add_handler(CallbackQueryHandler(view_debts_callback, pattern=r'^view_'))
     application.add_handler(CallbackQueryHandler(view_debt_detail_callback, pattern=r'^debt_\d+$'))
     application.add_handler(CallbackQueryHandler(mark_debt_paid_callback, pattern=r'^mark_paid_'))
     application.add_handler(CallbackQueryHandler(delete_debt_callback, pattern=r'^delete_debt_'))
     application.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern=r'^confirm_delete_'))
     application.add_handler(CallbackQueryHandler(edit_debt_callback, pattern=r'^edit_debt_'))
+    application.add_handler(CallbackQueryHandler(view_expense_callback, pattern=r'^expense_\d+$'))
+    application.add_handler(CallbackQueryHandler(delete_expense_callback, pattern=r'^delete_expense_'))
+    application.add_handler(CallbackQueryHandler(confirm_delete_expense_callback, pattern=r'^confirm_del_exp_'))
+    application.add_handler(CallbackQueryHandler(back_expenses_callback, pattern=r'^back_expenses$'))
     application.add_handler(CallbackQueryHandler(back_main_callback, pattern=r'^back_main$'))
     application.add_handler(CallbackQueryHandler(back_debts_callback, pattern=r'^back_debts$'))
     
