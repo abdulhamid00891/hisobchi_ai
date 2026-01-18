@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 # Conversation states
 (DEBT_SELECT_CONTACT, DEBT_NAME, DEBT_PHONE, DEBT_AMOUNT, DEBT_PAYMENT_TYPE, DEBT_GIVEN_DATE, 
- DEBT_DUE_DATE, DEBT_INSTALLMENTS, DEBT_CONFIRM) = range(9)
-EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(9, 12)
+ DEBT_DUE_DATE, DEBT_INSTALLMENTS, DEBT_CONFIRM, DEBT_PARTIAL_PAYMENT, DEBT_EDIT_FIELD, DEBT_EDIT_VALUE) = range(12)
+EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_CATEGORY = range(12, 15)
 
 # ============== KEYBOARDS ==============
 def main_menu_keyboard():
@@ -98,12 +98,35 @@ def debt_list_keyboard(debts, page=0):
     keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(keyboard)
 
-def debt_action_keyboard(debt_id, is_paid=False):
+def debt_action_keyboard(debt_id, debt_type, is_paid=False):
     keyboard = []
     if not is_paid:
-        keyboard.append([InlineKeyboardButton("✅ To'landi", callback_data=f"mark_paid_{debt_id}")])
+        # Repayment buttons based on debt type
+        if debt_type == 'given':
+            keyboard.append([InlineKeyboardButton("💵 Qarzini berdi", callback_data=f"repay_{debt_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("💵 Qarzimni berdim", callback_data=f"repay_{debt_id}")])
+        keyboard.append([InlineKeyboardButton("✅ To'liq to'landi", callback_data=f"mark_paid_{debt_id}")])
+    keyboard.append([InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"edit_debt_{debt_id}")])
     keyboard.append([InlineKeyboardButton("🗑 O'chirish", callback_data=f"delete_debt_{debt_id}")])
     keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_debts")])
+    return InlineKeyboardMarkup(keyboard)
+
+def debt_edit_keyboard(debt_id):
+    keyboard = [
+        [InlineKeyboardButton("👤 Ismni o'zgartirish", callback_data=f"editfield_name_{debt_id}")],
+        [InlineKeyboardButton("📱 Telefonni o'zgartirish", callback_data=f"editfield_phone_{debt_id}")],
+        [InlineKeyboardButton("💵 Summani o'zgartirish", callback_data=f"editfield_amount_{debt_id}")],
+        [InlineKeyboardButton("⏰ Muddatni o'zgartirish", callback_data=f"editfield_due_{debt_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data=f"debt_{debt_id}")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def delete_confirm_keyboard(debt_id):
+    keyboard = [
+        [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"confirm_delete_{debt_id}"),
+         InlineKeyboardButton("❌ Yo'q", callback_data=f"debt_{debt_id}")]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 # ============== UTILS ==============
@@ -253,6 +276,22 @@ async def delete_debt(debt_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM debts WHERE id = ?", (debt_id,))
         await db.commit()
+
+async def update_debt_amount(debt_id, new_amount):
+    """Update debt amount after partial payment"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE debts SET amount = ? WHERE id = ?", (new_amount, debt_id))
+        await db.commit()
+
+async def update_debt_field(debt_id, field, value):
+    """Update a specific field of a debt"""
+    allowed_fields = ['person_name', 'phone_number', 'amount', 'due_date']
+    if field not in allowed_fields:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE debts SET {field} = ? WHERE id = ?", (value, debt_id))
+        await db.commit()
+        return True
 
 async def add_expense(user_id, description, amount, currency, category):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -613,15 +652,17 @@ async def view_debt_detail_callback(update: Update, context: ContextTypes.DEFAUL
     
     days = days_until(debt['due_date'])
     status = "✅ To'langan" if debt['is_paid'] else f"📆 {days} kun qoldi" if days >= 0 else f"🔴 {abs(days)} kun o'tdi"
+    phone_display = debt.get('phone_number') or "Kiritilmagan"
     
     text = f"""
 👤 <b>{debt['person_name']}</b>
+📱 Telefon: {phone_display}
 💰 {format_money(debt['amount'], debt['currency'])}
 📅 Berilgan: {format_date(debt['given_date'])}
 ⏰ Muddat: {format_date(debt['due_date'])}
 {status}
 """
-    await query.edit_message_text(text, parse_mode='HTML', reply_markup=debt_action_keyboard(debt_id, debt['is_paid']))
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=debt_action_keyboard(debt_id, debt['debt_type'], debt['is_paid']))
 
 async def mark_debt_paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -635,9 +676,183 @@ async def delete_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     debt_id = int(query.data.replace("delete_debt_", ""))
+    debt = await get_debt_by_id(debt_id)
+    if not debt:
+        await query.edit_message_text("❌ Qarz topilmadi.")
+        return
+    await query.edit_message_text(
+        f"⚠️ <b>O'chirishni tasdiqlang</b>\n\n👤 {debt['person_name']}\n💰 {format_money(debt['amount'], debt['currency'])}\n\nRostdan ham o'chirmoqchimisiz?",
+        parse_mode='HTML',
+        reply_markup=delete_confirm_keyboard(debt_id)
+    )
+
+async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    debt_id = int(query.data.replace("confirm_delete_", ""))
     await delete_debt(debt_id)
     await query.edit_message_text("🗑 <b>O'chirildi!</b>", parse_mode='HTML')
     await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
+
+# REPAYMENT HANDLERS
+async def repay_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    debt_id = int(query.data.replace("repay_", ""))
+    debt = await get_debt_by_id(debt_id)
+    
+    if not debt:
+        await query.edit_message_text("❌ Qarz topilmadi.")
+        return
+    
+    context.user_data['repay_debt_id'] = debt_id
+    context.user_data['repay_debt'] = debt
+    
+    await query.edit_message_text(
+        f"💵 <b>Qarzdorlikni so'ndirish</b>\n\n"
+        f"👤 {debt['person_name']}\n"
+        f"💰 Jami qarz: {format_money(debt['amount'], debt['currency'])}\n\n"
+        f"Qancha to'landi? Summani kiriting:\n"
+        f"<i>Masalan: 50000 yoki 100 USD</i>\n\n"
+        f"<i>To'liq to'landi bo'lsa, summa o'rniga 'hammasi' yozing</i>",
+        parse_mode='HTML'
+    )
+    return DEBT_PARTIAL_PAYMENT
+
+async def repay_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    debt_id = context.user_data.get('repay_debt_id')
+    debt = context.user_data.get('repay_debt')
+    
+    if not debt_id or not debt:
+        await update.message.reply_text("❌ Xatolik yuz berdi.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    
+    if text in ['hammasi', 'hamma', 'toliq', "to'liq", 'all']:
+        # Full payment
+        await mark_debt_paid(debt_id)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ <b>To'liq to'landi!</b>\n\n👤 {debt['person_name']}\n💰 {format_money(debt['amount'], debt['currency'])}",
+            parse_mode='HTML',
+            reply_markup=main_menu_keyboard()
+        )
+        return ConversationHandler.END
+    
+    paid_amount, currency = parse_amount(text)
+    if paid_amount is None or paid_amount <= 0:
+        await update.message.reply_text("❌ Summani to'g'ri kiriting!")
+        return DEBT_PARTIAL_PAYMENT
+    
+    # Check if currencies match or convert
+    if currency != debt['currency']:
+        await update.message.reply_text(f"❌ Valyuta mos emas! Qarz {debt['currency']} da.")
+        return DEBT_PARTIAL_PAYMENT
+    
+    remaining = debt['amount'] - paid_amount
+    
+    if remaining <= 0:
+        # Full payment
+        await mark_debt_paid(debt_id)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ <b>To'liq to'landi!</b>\n\n👤 {debt['person_name']}\n💰 {format_money(debt['amount'], debt['currency'])}",
+            parse_mode='HTML',
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        # Partial payment
+        await update_debt_amount(debt_id, remaining)
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ <b>To'lov qabul qilindi!</b>\n\n"
+            f"👤 {debt['person_name']}\n"
+            f"💵 To'langan: {format_money(paid_amount, currency)}\n"
+            f"💰 Qolgan qarz: {format_money(remaining, currency)}",
+            parse_mode='HTML',
+            reply_markup=main_menu_keyboard()
+        )
+    return ConversationHandler.END
+
+# EDIT HANDLERS
+async def edit_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    debt_id = int(query.data.replace("edit_debt_", ""))
+    debt = await get_debt_by_id(debt_id)
+    
+    if not debt:
+        await query.edit_message_text("❌ Qarz topilmadi.")
+        return
+    
+    await query.edit_message_text(
+        f"✏️ <b>Tahrirlash</b>\n\n"
+        f"👤 {debt['person_name']}\n"
+        f"📱 {debt.get('phone_number') or 'Kiritilmagan'}\n"
+        f"💰 {format_money(debt['amount'], debt['currency'])}\n"
+        f"⏰ {format_date(debt['due_date'])}\n\n"
+        f"Nimani o'zgartirmoqchisiz?",
+        parse_mode='HTML',
+        reply_markup=debt_edit_keyboard(debt_id)
+    )
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.replace("editfield_", "")
+    field, debt_id = data.rsplit("_", 1)
+    debt_id = int(debt_id)
+    
+    context.user_data['edit_debt_id'] = debt_id
+    context.user_data['edit_field'] = field
+    
+    field_names = {
+        'name': ('👤 Yangi ismni kiriting:', 'person_name'),
+        'phone': ('📱 Yangi telefon raqamini kiriting:', 'phone_number'),
+        'amount': ('💵 Yangi summani kiriting:', 'amount'),
+        'due': ('⏰ Yangi muddatni kiriting (kun.oy.yil):', 'due_date')
+    }
+    
+    prompt, db_field = field_names.get(field, ('Yangi qiymatni kiriting:', field))
+    context.user_data['edit_db_field'] = db_field
+    
+    await query.edit_message_text(prompt, parse_mode='HTML')
+    return DEBT_EDIT_VALUE
+
+async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    debt_id = context.user_data.get('edit_debt_id')
+    field = context.user_data.get('edit_field')
+    db_field = context.user_data.get('edit_db_field')
+    
+    if not debt_id or not field:
+        await update.message.reply_text("❌ Xatolik yuz berdi.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    
+    # Validate and process value based on field type
+    if field == 'amount':
+        amount, currency = parse_amount(text)
+        if amount is None or amount <= 0:
+            await update.message.reply_text("❌ Summani to'g'ri kiriting!")
+            return DEBT_EDIT_VALUE
+        value = amount
+    elif field == 'due':
+        parsed = parse_date(text)
+        if not parsed:
+            await update.message.reply_text("❌ Sanani to'g'ri kiriting! (kun.oy.yil)")
+            return DEBT_EDIT_VALUE
+        value = parsed
+    elif field == 'phone':
+        value = re.sub(r'[^\d+]', '', text) if text.lower() not in ["yo'q", "yoq", "-"] else None
+    else:
+        value = text
+    
+    await update_debt_field(debt_id, db_field, value)
+    context.user_data.clear()
+    
+    await update.message.reply_text("✅ <b>O'zgartirildi!</b>", parse_mode='HTML', reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
 
 async def statistics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -740,18 +955,42 @@ def main():
         allow_reentry=True
     )
     
+    # Repayment handler
+    repay_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(repay_debt_callback, pattern=r'^repay_')],
+        states={
+            DEBT_PARTIAL_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, repay_amount_received)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command), CommandHandler('start', start_command)],
+        allow_reentry=True
+    )
+    
+    # Edit handler
+    edit_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_field_callback, pattern=r'^editfield_')],
+        states={
+            DEBT_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_received)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command), CommandHandler('start', start_command)],
+        allow_reentry=True
+    )
+    
     # Add handlers
     application.add_handler(CommandHandler('start', start_command))
     application.add_handler(CommandHandler('cancel', cancel_command))
     application.add_handler(debt_given_handler)
     application.add_handler(debt_taken_handler)
     application.add_handler(expense_handler)
+    application.add_handler(repay_handler)
+    application.add_handler(edit_handler)
     application.add_handler(MessageHandler(filters.Regex(r'^📊 Statistika$'), statistics_handler))
     application.add_handler(MessageHandler(filters.Regex(r'^📋 Mening qarzlarim$'), my_debts_handler))
     application.add_handler(CallbackQueryHandler(view_debts_callback, pattern=r'^view_'))
     application.add_handler(CallbackQueryHandler(view_debt_detail_callback, pattern=r'^debt_\d+$'))
     application.add_handler(CallbackQueryHandler(mark_debt_paid_callback, pattern=r'^mark_paid_'))
     application.add_handler(CallbackQueryHandler(delete_debt_callback, pattern=r'^delete_debt_'))
+    application.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern=r'^confirm_delete_'))
+    application.add_handler(CallbackQueryHandler(edit_debt_callback, pattern=r'^edit_debt_'))
     application.add_handler(CallbackQueryHandler(back_main_callback, pattern=r'^back_main$'))
     application.add_handler(CallbackQueryHandler(back_debts_callback, pattern=r'^back_debts$'))
     
